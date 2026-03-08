@@ -1,0 +1,444 @@
+import depthai as dai
+import cv2
+import numpy as np
+import os
+import glob
+from datetime import datetime
+import shutil
+
+# 修复路径问题 - 使用当前目录
+base_dir = os.path.join(os.getcwd(), "bottle_dataset")
+rgb_save_path = os.path.join(base_dir, "images", "train", "1")
+depth_save_path = os.path.join(base_dir, "images", "train", "2")
+labels_save_path = os.path.join(base_dir, "labels", "train", "3")
+
+# 自动创建目录
+os.makedirs(rgb_save_path, exist_ok=True)
+os.makedirs(depth_save_path, exist_ok=True)
+os.makedirs(labels_save_path, exist_ok=True)
+
+# 用于记录最近保存的文件
+recent_files = []
+
+
+def check_directory_permission(path):
+    """检查目录是否有写入权限"""
+    try:
+        test_file = os.path.join(path, "test_permission.jpg")
+        # 创建一个测试图像
+        test_image = np.zeros((100, 100, 3), dtype=np.uint8)
+        success = cv2.imwrite(test_file, test_image)
+        if success and os.path.exists(test_file):
+            file_size = os.path.getsize(test_file)
+            os.remove(test_file)
+            print(f"✅ 路径 {path} 可写，测试文件大小: {file_size} 字节")
+            return True
+        else:
+            print(f"❌ 路径 {path} 不可写或文件未创建")
+            return False
+    except Exception as e:
+        print(f"❌ 路径 {path} 权限检查失败: {e}")
+        return False
+
+
+def check_disk_space(path):
+    """检查磁盘空间"""
+    try:
+        total, used, free = shutil.disk_usage(path)
+        free_gb = free // (2 ** 30)
+        free_mb = free // (2 ** 20)
+        print(
+            f"💾 磁盘空间 - 总空间: {total // (2 ** 30)}GB, 已用: {used // (2 ** 30)}GB, 剩余: {free_gb}GB ({free_mb}MB)")
+        return free > 100 * 1024 * 1024  # 至少100MB空间
+    except Exception as e:
+        print(f"❌ 磁盘空间检查失败: {e}")
+        return False
+
+
+def verify_saved_image(filepath, expected_size=None):
+    """验证保存的图像文件"""
+    try:
+        if not os.path.exists(filepath):
+            print(f"❌ 文件不存在: {filepath}")
+            return False
+
+        file_size = os.path.getsize(filepath)
+        if file_size == 0:
+            print(f"❌ 文件大小为0: {filepath}")
+            return False
+
+        # 尝试读取图像验证完整性
+        img = cv2.imread(filepath)
+        if img is None:
+            print(f"❌ 文件无法读取或已损坏: {filepath}")
+            return False
+
+        if expected_size is not None:
+            h, w = img.shape[:2]
+            expected_h, expected_w = expected_size
+            if h != expected_h or w != expected_w:
+                print(f"⚠️ 图像尺寸不匹配: 实际({h}x{w}) vs 预期({expected_h}x{expected_w})")
+
+        print(f"✅ 文件验证成功: {filepath} (大小: {file_size} 字节, 尺寸: {img.shape[1]}x{img.shape[0]})")
+        return True
+
+    except Exception as e:
+        print(f"❌ 文件验证失败 {filepath}: {e}")
+        return False
+
+
+def delete_last_files():
+    """删除最近保存的一组文件"""
+    global recent_files, frame_count, positive_count, negative_count
+
+    if not recent_files:
+        print("❌ 没有可删除的文件")
+        return False
+
+    last_files = recent_files[-1]  # 获取最近保存的一组文件
+    deleted_count = 0
+    sample_type = last_files.get('type', '未知')
+
+    print(f"🗑️ 尝试删除上一组{sample_type}文件...")
+
+    # 删除文件
+    for file_type, filepath in last_files['files']:
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+                print(f"   ✅ 已删除{file_type}文件: {os.path.basename(filepath)}")
+                deleted_count += 1
+            else:
+                print(f"   ⚠️ 文件不存在: {os.path.basename(filepath)}")
+        except Exception as e:
+            print(f"   ❌ 删除{file_type}文件失败: {e}")
+
+    # 从记录中移除
+    if len(recent_files) > 0:
+        recent_files.pop()
+
+    # 更新计数器
+    if deleted_count > 0:
+        frame_count = max(0, frame_count - 1)
+        if sample_type == "正样本":
+            positive_count = max(0, positive_count - 1)
+        elif sample_type == "负样本":
+            negative_count = max(0, negative_count - 1)
+
+        print(f"✅ 成功删除{sample_type}，已删除 {deleted_count} 个文件")
+        print(f"📊 更新统计: 总数={frame_count}, 正样本={positive_count}, 负样本={negative_count}")
+        return True
+    else:
+        print("❌ 没有文件被删除")
+        return False
+
+
+def test_image_save_functionality():
+    """全面测试图像保存功能"""
+    print("=" * 50)
+    print("开始图像保存功能测试...")
+    print("=" * 50)
+
+    # 测试路径权限
+    print("\n1. 检查目录权限...")
+    path_checks = []
+    for path, name in [(rgb_save_path, "RGB"), (depth_save_path, "Depth"), (labels_save_path, "Labels")]:
+        print(f"  检查{name}路径: {path}")
+        if check_directory_permission(path):
+            path_checks.append(True)
+        else:
+            path_checks.append(False)
+
+    # 检查磁盘空间
+    print("\n2. 检查磁盘空间...")
+    disk_ok = check_disk_space(rgb_save_path)
+
+    # 测试不同格式保存
+    print("\n3. 测试图像格式保存...")
+    test_path = rgb_save_path
+    test_formats = [('.jpg', 'JPEG'), ('.png', 'PNG')]
+    format_checks = []
+
+    for ext, format_name in test_formats:
+        test_file = os.path.join(test_path, f"test_format{ext}")
+        test_img = np.random.randint(0, 255, (200, 300, 3), dtype=np.uint8)
+
+        try:
+            success = cv2.imwrite(test_file, test_img)
+            if success:
+                verify_success = verify_saved_image(test_file, (200, 300))
+                if verify_success:
+                    format_checks.append(True)
+                    print(f"   ✅ {format_name}格式测试通过")
+                else:
+                    format_checks.append(False)
+                    print(f"   ❌ {format_name}格式验证失败")
+                # 清理测试文件
+                if os.path.exists(test_file):
+                    os.remove(test_file)
+            else:
+                format_checks.append(False)
+                print(f"   ❌ {format_name}格式保存失败")
+        except Exception as e:
+            format_checks.append(False)
+            print(f"   ❌ {format_name}格式测试异常: {e}")
+
+    # 总结测试结果
+    print("\n" + "=" * 50)
+    print("测试结果总结:")
+    print(f"  目录权限: {'✅ 通过' if all(path_checks) else '❌ 失败'}")
+    print(f"  磁盘空间: {'✅ 充足' if disk_ok else '❌ 不足'}")
+    print(f"  图像格式: {'✅ 通过' if any(format_checks) else '❌ 失败'}")
+
+    if all(path_checks) and disk_ok and any(format_checks):
+        print("🎉 所有测试通过！可以开始数据采集")
+        return True
+    else:
+        print("❌ 存在测试失败项，请检查上述问题")
+        return False
+
+
+# 运行全面测试
+if not test_image_save_functionality():
+    print("程序退出：环境检查未通过")
+    exit(1)
+
+print("\n" + "=" * 50)
+print("开始数据采集...")
+print("=" * 50)
+
+# 创建管道
+pipeline = dai.Pipeline()
+
+# 配置节点
+cam_rgb = pipeline.create(dai.node.ColorCamera)
+cam_rgb.setPreviewSize(640, 400)
+cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
+cam_rgb.setInterleaved(False)
+cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
+
+mono_left = pipeline.create(dai.node.MonoCamera)
+mono_left.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
+mono_left.setCamera("left")
+
+mono_right = pipeline.create(dai.node.MonoCamera)
+mono_right.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
+mono_right.setCamera("right")
+
+stereo = pipeline.create(dai.node.StereoDepth)
+stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_ACCURACY)
+stereo.initialConfig.setMedianFilter(dai.MedianFilter.KERNEL_7x7)
+stereo.setLeftRightCheck(True)
+stereo.setExtendedDisparity(False)
+stereo.setSubpixel(True)
+
+xout_rgb = pipeline.create(dai.node.XLinkOut)
+xout_rgb.setStreamName("rgb")
+xout_depth = pipeline.create(dai.node.XLinkOut)
+xout_depth.setStreamName("depth")
+
+cam_rgb.preview.link(xout_rgb.input)
+mono_left.out.link(stereo.left)
+mono_right.out.link(stereo.right)
+stereo.depth.link(xout_depth.input)
+
+frame_count = 0
+positive_count = 0
+negative_count = 0
+current_rgb_frame = None
+current_depth_frame = None
+last_save_status = "就绪"
+
+print("按 's' 键保存有水瓶的图像（正样本）")
+print("按 'n' 键保存无水瓶的图像（负样本）")
+print("按 'a' 键删除上一组保存的文件")
+print("按 'q' 键退出程序")
+
+with dai.Device(pipeline) as device:
+    q_rgb = device.getOutputQueue(name="rgb", maxSize=1, blocking=False)
+    q_depth = device.getOutputQueue(name="depth", maxSize=1, blocking=False)
+
+    while True:
+        in_rgb = q_rgb.tryGet()
+        in_depth = q_depth.tryGet()
+
+        if in_rgb is not None:
+            current_rgb_frame = in_rgb.getCvFrame()
+            display_rgb = current_rgb_frame.copy()
+
+            # 显示状态信息
+            status_color = (0, 255, 0) if last_save_status == "就绪" else (0, 255, 255)
+            cv2.putText(display_rgb, f"状态: {last_save_status}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+            cv2.putText(display_rgb, f"已保存: {frame_count}", (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(display_rgb, f"正样本: {positive_count} 负样本: {negative_count}", (10, 90),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(display_rgb, "'s'-有水瓶, 'n'-无水瓶, 'a'-删除上一张, 'q'-退出", (10, 120),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            cv2.imshow("RGB", display_rgb)
+
+        if in_depth is not None:
+            current_depth_frame = in_depth.getFrame()
+            depth_vis = cv2.normalize(current_depth_frame, None, 0, 255, cv2.NORM_MINMAX)
+            depth_vis = np.uint8(depth_vis)
+            depth_vis = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
+            display_depth = depth_vis.copy()
+            cv2.putText(display_depth, f"已保存: {frame_count}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            cv2.imshow("Depth", display_depth)
+
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord('q'):
+            print("退出数据采集")
+            break
+
+        elif key == ord('a'):
+            # 删除上一组文件
+            if delete_last_files():
+                last_save_status = "删除成功"
+            else:
+                last_save_status = "删除失败"
+
+        elif key == ord('s') or key == ord('n'):
+            if current_rgb_frame is not None and current_depth_frame is not None:
+                last_save_status = "保存中..."
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+                base_filename = f"rgb_{timestamp}_{frame_count:06d}"
+
+                save_success = True
+                saved_files = []
+                sample_type = "正样本" if key == ord('s') else "负样本"
+
+                # 保存彩色图
+                rgb_filename = f"{base_filename}.jpg"
+                rgb_filepath = os.path.join(rgb_save_path, rgb_filename)
+
+                try:
+                    success_rgb = cv2.imwrite(rgb_filepath, current_rgb_frame)
+                    if success_rgb:
+                        # 立即验证保存的文件
+                        if verify_saved_image(rgb_filepath, current_rgb_frame.shape[:2]):
+                            saved_files.append(('RGB', rgb_filepath))
+                            print(f"✅ RGB图像保存成功")
+                        else:
+                            save_success = False
+                            print(f"❌ RGB图像验证失败")
+                    else:
+                        save_success = False
+                        print(f"❌ RGB图像保存失败")
+                except Exception as e:
+                    save_success = False
+                    print(f"❌ 保存RGB图像时出错: {e}")
+
+                # 保存深度图
+                depth_filename = f"depth_{timestamp}_{frame_count:06d}.png"
+                depth_filepath = os.path.join(depth_save_path, depth_filename)
+
+                try:
+                    success_depth = cv2.imwrite(depth_filepath, current_depth_frame)
+                    if success_depth:
+                        if verify_saved_image(depth_filepath):
+                            saved_files.append(('Depth', depth_filepath))
+                            print(f"✅ 深度图保存成功")
+                        else:
+                            save_success = False
+                            print(f"❌ 深度图验证失败")
+                    else:
+                        save_success = False
+                        print(f"❌ 深度图保存失败")
+                except Exception as e:
+                    save_success = False
+                    print(f"❌ 保存深度图时出错: {e}")
+
+                # 只给负样本创建空的标注文件
+                if key == ord('n'):  # 负样本
+                    label_filename = f"{base_filename}.txt"
+                    label_filepath = os.path.join(labels_save_path, label_filename)
+
+                    try:
+                        # 创建空的标注文件
+                        with open(label_filepath, 'w') as f:
+                            pass  # 不写入任何内容，创建空文件
+
+                        if os.path.exists(label_filepath):
+                            file_size = os.path.getsize(label_filepath)
+                            if file_size == 0:  # 确保文件是空的
+                                saved_files.append(('Label', label_filepath))
+                                print(f"✅ 负样本空标注文件创建成功")
+                            else:
+                                save_success = False
+                                print(f"❌ 标注文件非空，创建失败")
+                        else:
+                            save_success = False
+                            print(f"❌ 标注文件创建失败")
+
+                    except Exception as e:
+                        save_success = False
+                        print(f"❌ 创建标注文件失败: {e}")
+
+                    negative_count += 1
+                else:  # 正样本
+                    positive_count += 1
+                    print(f"✅ 正样本不创建标注文件")
+
+                if save_success:
+                    # 记录保存的文件信息
+                    file_group = {
+                        'type': sample_type,
+                        'base_filename': base_filename,
+                        'files': saved_files.copy()
+                    }
+                    recent_files.append(file_group)
+
+                    frame_count += 1
+                    last_save_status = f"保存成功 #{frame_count}"
+                    print(f"🎉 {sample_type}保存完成: {base_filename}")
+                    print(f"   生成文件: {[f[0] for f in saved_files]}")
+                else:
+                    last_save_status = "保存失败"
+                    print(f"❌ {sample_type}保存失败，已清理不完整文件")
+                    # 清理不完整的文件
+                    for file_type, filepath in saved_files:
+                        if os.path.exists(filepath):
+                            os.remove(filepath)
+                            print(f"   已删除: {filepath}")
+
+cv2.destroyAllWindows()
+
+# 最终统计和验证
+print("\n" + "=" * 50)
+print("数据采集完成！")
+print("=" * 50)
+
+print(f"\n📊 采集统计:")
+print(f"  正样本（有水瓶）: {positive_count} 个")
+print(f"  负样本（无水瓶）: {negative_count} 个")
+print(f"  总计: {frame_count} 对图像")
+
+print(f"\n📁 保存路径:")
+print(f"  彩色图: {rgb_save_path}")
+print(f"  深度图: {depth_save_path}")
+print(f"  标注文件: {labels_save_path}")
+
+# 最终文件校验
+print("\n🔍 最终文件校验:")
+rgb_files = glob.glob(os.path.join(rgb_save_path, "*.jpg"))
+depth_files = glob.glob(os.path.join(depth_save_path, "*.png"))
+label_files = glob.glob(os.path.join(labels_save_path, "*.txt"))
+
+print(f"  彩色图数量: {len(rgb_files)}")
+print(f"  深度图数量: {len(depth_files)}")
+print(f"  标注文件数量: {len(label_files)} (仅负样本)")
+
+if len(rgb_files) > 0:
+    print(f"\n📝 样本文件示例:")
+    for i, file in enumerate(rgb_files[:3]):  # 显示前3个文件
+        file_size = os.path.getsize(file)
+        print(f"  {i + 1}. {os.path.basename(file)} ({file_size} 字节)")
+
+print(f"\n🎯 标注说明:")
+print(f"  • 正样本（有水瓶）: 无标注文件，需要手动标注")
+print(f"  • 负样本（无水瓶）: 有空标注文件（0字节）")
+print(f"  • 使用labelImg标注时，只标注有水瓶的正样本图像")

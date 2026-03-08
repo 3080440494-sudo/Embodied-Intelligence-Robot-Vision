@@ -1,0 +1,5 @@
+path: D:/oak/bottle_dataset
+train: images/train
+val: images/train
+nc: 1
+names: ['bottle']
